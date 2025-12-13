@@ -5,5 +5,5 @@ scikit-learn>=1.3.0
 PyPDF2>=3.0.0
 pdfplumber>=0.10.0
 
-torch==2.1.0+cpu
-sentence-transformers==2.2.2
+# torch is installed separately in Dockerfile from CPU index
+sentence-transformers>=2.7.0
