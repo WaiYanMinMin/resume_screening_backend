@@ -1,7 +1,7 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from typing import List, Dict
+from typing import List, Dict, Optional
 from pydantic import BaseModel
 import uvicorn
 import os
@@ -41,6 +41,15 @@ data_store = DataStore()
 TEMP_DIR = Path(tempfile.gettempdir()) / "resume_uploads"
 TEMP_DIR.mkdir(exist_ok=True)
 
+# Session management - each user gets isolated data
+# Session ID can be passed via X-Session-ID header or generated automatically
+def get_session_id(x_session_id: Optional[str] = Header(None)) -> str:
+    """Get or create session ID from header"""
+    if x_session_id:
+        return x_session_id
+    # Generate new session ID if not provided
+    return str(uuid_lib.uuid4())
+
 # Pydantic models
 class ProcessResumeRequest(BaseModel):
     resume_id: str
@@ -48,13 +57,19 @@ class ProcessResumeRequest(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"message": "Resume Screening API"}
+    return {"message": "Resume Screening API - Use X-Session-ID header for private sessions"}
+
+@app.post("/create_session")
+async def create_session():
+    """Create a new session and return session ID"""
+    session_id = str(uuid_lib.uuid4())
+    return {"session_id": session_id, "message": "Use this session_id in X-Session-ID header for all requests"}
 
 @app.delete("/resume/{resume_id}")
-async def delete_resume(resume_id: str):
-    """Delete a resume by ID"""
+async def delete_resume(resume_id: str, session_id: str = Depends(get_session_id)):
+    """Delete a resume by ID (only from your session)"""
     try:
-        deleted = data_store.delete_resume(resume_id)
+        deleted = data_store.delete_resume(session_id, resume_id)
         if deleted:
             return {"message": f"Resume {resume_id} deleted successfully"}
         else:
@@ -63,17 +78,17 @@ async def delete_resume(resume_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/resumes")
-async def delete_all_resumes():
-    """Delete all resumes"""
+async def delete_all_resumes(session_id: str = Depends(get_session_id)):
+    """Delete all resumes (only from your session)"""
     try:
-        data_store.clear_all()
+        data_store.clear_all(session_id)
         return {"message": "All resumes deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/upload_resume")
-async def upload_resume(file: UploadFile = File(...)):
-    """Upload a PDF resume and extract text (file is deleted after extraction)"""
+async def upload_resume(file: UploadFile = File(...), session_id: str = Depends(get_session_id)):
+    """Upload a PDF resume and extract text (file is deleted after extraction). Isolated per session."""
     try:
         if not file.filename.endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
@@ -92,11 +107,12 @@ async def upload_resume(file: UploadFile = File(...)):
             # Extract text from PDF
             text = pdf_extractor.extract_text(str(file_path))
             
-            # Store resume data (in-memory only, no file storage)
-            resume_id = data_store.add_resume(file.filename, text)
+            # Store resume data (in-memory only, isolated per session)
+            resume_id = data_store.add_resume(session_id, file.filename, text)
             
             return {
                 "resume_id": resume_id,
+                "session_id": session_id,
                 "filename": file.filename,
                 "text": text[:500] + "..." if len(text) > 500 else text  # Preview
             }
@@ -108,12 +124,12 @@ async def upload_resume(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/process_resume")
-async def process_resume(request: ProcessResumeRequest):
-    """Process a resume against a job description"""
+async def process_resume(request: ProcessResumeRequest, session_id: str = Depends(get_session_id)):
+    """Process a resume against a job description (only resumes from your session)"""
     try:
         resume_id = request.resume_id
         job_description = request.job_description
-        resume = data_store.get_resume(resume_id)
+        resume = data_store.get_resume(session_id, resume_id)
         if not resume:
             raise HTTPException(status_code=404, detail="Resume not found")
         
@@ -142,6 +158,7 @@ async def process_resume(request: ProcessResumeRequest):
         
         # Update resume data
         data_store.update_resume_processing(
+            session_id,
             resume_id,
             similarity_score,
             skills,
@@ -159,10 +176,10 @@ async def process_resume(request: ProcessResumeRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/top_candidates")
-async def top_candidates(job_description: str = ""):
-    """Get ranked candidates sorted by similarity score"""
+async def top_candidates(job_description: str = "", session_id: str = Depends(get_session_id)):
+    """Get ranked candidates sorted by similarity score (only from your session)"""
     try:
-        candidates = data_store.get_all_candidates()
+        candidates = data_store.get_all_candidates(session_id)
         
         if not candidates:
             return {"candidates": []}
@@ -189,7 +206,16 @@ async def top_candidates(job_description: str = ""):
                         cluster_label = clusterer.assign_cluster(resume_emb)
                         # Extract skills
                         skills = skill_extractor.extract_skills(resume_text)
-                        # Update candidate data
+                        # Update resume data in store
+                        data_store.update_resume_processing(
+                            session_id,
+                            candidate["resume_id"],
+                            0.0,  # Similarity will be calculated below
+                            skills,
+                            cluster_label,
+                            resume_emb.tolist()
+                        )
+                        # Update candidate data for response
                         candidate["embedding"] = resume_emb.tolist()
                         candidate["cluster_label"] = int(cluster_label)
                         candidate["skills"] = skills
@@ -208,6 +234,18 @@ async def top_candidates(job_description: str = ""):
                     resume_emb, job_embedding
                 )
                 candidate["similarity_score"] = float(similarity)
+                # Update similarity score in data store
+                if candidate.get("resume_id"):
+                    existing_resume = data_store.get_resume(session_id, candidate["resume_id"])
+                    if existing_resume:
+                        data_store.update_resume_processing(
+                            session_id,
+                            candidate["resume_id"],
+                            float(similarity),
+                            existing_resume.get("skills", []),
+                            existing_resume.get("cluster_label", 0),
+                            existing_resume.get("embedding", resume_emb.tolist() if isinstance(resume_emb, np.ndarray) else resume_emb)
+                        )
         
         # Sort by similarity score (descending)
         ranked_candidates = sorted(
@@ -221,10 +259,10 @@ async def top_candidates(job_description: str = ""):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/clusters")
-async def get_clusters():
-    """Get cluster visualization data (PCA/t-SNE coordinates)"""
+async def get_clusters(session_id: str = Depends(get_session_id)):
+    """Get cluster visualization data (PCA/t-SNE coordinates) - only from your session"""
     try:
-        candidates = data_store.get_all_candidates()
+        candidates = data_store.get_all_candidates(session_id)
         
         if len(candidates) < 2:
             return {
@@ -267,10 +305,10 @@ async def get_clusters():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/export_csv")
-async def export_csv():
-    """Export ranked candidates as CSV"""
+async def export_csv(session_id: str = Depends(get_session_id)):
+    """Export ranked candidates as CSV (only from your session)"""
     try:
-        candidates = data_store.get_all_candidates()
+        candidates = data_store.get_all_candidates(session_id)
         
         # Sort by similarity score
         ranked_candidates = sorted(

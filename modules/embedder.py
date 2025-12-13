@@ -11,7 +11,7 @@ class Embedder:
         Uses a lightweight model for faster processing
         """
         try:
-            self.model = SentenceTransformer(model_name)
+            self.model = SentenceTransformer(model_name,cache_folder="./models")
         except Exception as e:
             print(f"Error loading model: {e}")
             print("Falling back to a simpler approach...")
