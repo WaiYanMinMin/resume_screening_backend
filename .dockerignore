@@ -28,9 +28,6 @@ README.md
 .env
 .env.local
 
-# Uploads (don't copy existing uploads to image)
-uploads/*.pdf
-
 # OS
 .DS_Store
 Thumbs.db

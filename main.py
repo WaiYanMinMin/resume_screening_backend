@@ -5,6 +5,8 @@ from typing import List, Dict
 from pydantic import BaseModel
 import uvicorn
 import os
+import tempfile
+import uuid as uuid_lib
 from pathlib import Path
 
 from modules.pdf_extractor import PDFExtractor
@@ -35,9 +37,9 @@ skill_extractor = SkillExtractor()
 clusterer = Clusterer()
 data_store = DataStore()
 
-# Ensure upload directory exists
-UPLOAD_DIR = Path("uploads")
-UPLOAD_DIR.mkdir(exist_ok=True)
+# Use temporary directory for PDF processing (files deleted after extraction)
+TEMP_DIR = Path(tempfile.gettempdir()) / "resume_uploads"
+TEMP_DIR.mkdir(exist_ok=True)
 
 # Pydantic models
 class ProcessResumeRequest(BaseModel):
@@ -71,28 +73,37 @@ async def delete_all_resumes():
 
 @app.post("/upload_resume")
 async def upload_resume(file: UploadFile = File(...)):
-    """Upload a PDF resume and extract text"""
+    """Upload a PDF resume and extract text (file is deleted after extraction)"""
     try:
         if not file.filename.endswith('.pdf'):
             raise HTTPException(status_code=400, detail="Only PDF files are supported")
         
-        # Save uploaded file
-        file_path = UPLOAD_DIR / file.filename
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
+        # Create temporary file for PDF processing
+        # Use unique temp filename to avoid conflicts
+        temp_filename = f"{uuid_lib.uuid4()}_{file.filename}"
+        file_path = TEMP_DIR / temp_filename
         
-        # Extract text from PDF
-        text = pdf_extractor.extract_text(str(file_path))
-        
-        # Store resume data
-        resume_id = data_store.add_resume(file.filename, text)
-        
-        return {
-            "resume_id": resume_id,
-            "filename": file.filename,
-            "text": text[:500] + "..." if len(text) > 500 else text  # Preview
-        }
+        try:
+            # Save uploaded file temporarily
+            with open(file_path, "wb") as buffer:
+                content = await file.read()
+                buffer.write(content)
+            
+            # Extract text from PDF
+            text = pdf_extractor.extract_text(str(file_path))
+            
+            # Store resume data (in-memory only, no file storage)
+            resume_id = data_store.add_resume(file.filename, text)
+            
+            return {
+                "resume_id": resume_id,
+                "filename": file.filename,
+                "text": text[:500] + "..." if len(text) > 500 else text  # Preview
+            }
+        finally:
+            # Always delete the temporary file after processing
+            if file_path.exists():
+                file_path.unlink()
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
