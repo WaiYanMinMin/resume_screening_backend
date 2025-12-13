@@ -16,8 +16,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install PyTorch CPU and dependencies in optimized way
+# Install NumPy first (must be < 2.0 for PyTorch compatibility), then PyTorch, then other dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir "numpy>=1.24.0,<2.0.0" && \
     pip install --no-cache-dir \
     torch==2.1.0+cpu \
     --index-url https://download.pytorch.org/whl/cpu && \
