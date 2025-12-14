@@ -4,13 +4,15 @@ from typing import List, Optional, Dict
 class SimilarityCalculator:
     """Calculate similarity between resume and job description with skill gating and weighted scoring"""
     
-    def __init__(self, min_skill_overlap: float = 0.2):
+    def __init__(self, min_skill_overlap: float = 0.2, skill_penalty: float = 0.5):
         """
         Initialize similarity calculator
         Args:
-            min_skill_overlap: Minimum skill overlap ratio required (0.0 to 1.0)
+            min_skill_overlap: Minimum skill overlap ratio for full score (0.0 to 1.0)
+            skill_penalty: Penalty multiplier when skill overlap is below threshold (0.0 to 1.0)
         """
         self.min_skill_overlap = min_skill_overlap
+        self.skill_penalty = skill_penalty
     
     def skill_gate(self, resume_skills: List[str], jd_skills: List[str]) -> bool:
         """
@@ -96,18 +98,16 @@ class SimilarityCalculator:
         if not jd_skills:
             jd_skills = []
         
-        # Fix 1: Skill overlap gate (MOST IMPORTANT)
-        if not self.skill_gate(resume_skills, jd_skills):
-            return {
-                "final_score": 0.0,
-                "semantic_similarity": semantic_similarity,
-                "skill_coverage": 0.0,
-                "skill_gate_passed": False,
-                "flag": "Low skill overlap - insufficient match with job requirements"
-            }
-        
         # Calculate skill coverage
         skill_cov = self.skill_coverage(resume_skills, jd_skills)
+        
+        # Fix 1: Skill overlap penalty (instead of hard gate)
+        skill_gate_passed = self.skill_gate(resume_skills, jd_skills)
+        skill_penalty_multiplier = 1.0
+        
+        if not skill_gate_passed:
+            # Apply penalty instead of returning 0
+            skill_penalty_multiplier = self.skill_penalty  # e.g., 0.5 = 50% penalty
         
         # Fix 3: Domain mismatch penalty
         domain_penalty = 1.0
@@ -118,11 +118,13 @@ class SimilarityCalculator:
         # Production formula: 0.7 * semantic + 0.3 * skill_coverage
         weighted_score = (0.7 * semantic_similarity) + (0.3 * skill_cov)
         
-        # Apply domain penalty
-        final_score = weighted_score * domain_penalty
+        # Apply both skill and domain penalties
+        final_score = weighted_score * skill_penalty_multiplier * domain_penalty
         
         # Explainability flags
         flags = []
+        if not skill_gate_passed:
+            flags.append(f"Low skill overlap ({skill_cov:.1%}) - {int((1 - skill_penalty_multiplier) * 100)}% penalty applied")
         if semantic_similarity > 0.5 and skill_cov < 0.1:
             flags.append("High semantic similarity but low skill relevance")
         if resume_category and job_category and resume_category != job_category:
@@ -132,7 +134,8 @@ class SimilarityCalculator:
             "final_score": float(final_score),
             "semantic_similarity": semantic_similarity,
             "skill_coverage": skill_cov,
-            "skill_gate_passed": True,
+            "skill_gate_passed": skill_gate_passed,
+            "skill_penalty_applied": skill_penalty_multiplier < 1.0,
             "domain_penalty": domain_penalty,
             "flag": "; ".join(flags) if flags else None
         }

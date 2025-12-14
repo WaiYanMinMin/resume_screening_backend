@@ -33,7 +33,10 @@ app.add_middleware(
 pdf_extractor = PDFExtractor()
 preprocessor = TextPreprocessor()
 embedder = Embedder()
-similarity_calc = SimilarityCalculator(min_skill_overlap=0.2)  # 20% minimum skill overlap required
+similarity_calc = SimilarityCalculator(
+    min_skill_overlap=0.2,  # 20% skill overlap threshold
+    skill_penalty=0.5  # 50% penalty when below threshold (instead of 0)
+)
 skill_extractor = SkillExtractor()
 clusterer = Clusterer()
 data_store = DataStore()
