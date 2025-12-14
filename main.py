@@ -16,6 +16,7 @@ from modules.similarity import SimilarityCalculator
 from modules.skill_extractor import SkillExtractor
 from modules.clusterer import Clusterer
 from modules.data_store import DataStore
+from modules.category_classifier import CategoryClassifier
 import numpy as np
 app = FastAPI(title="Resume Screening API")
 
@@ -32,10 +33,11 @@ app.add_middleware(
 pdf_extractor = PDFExtractor()
 preprocessor = TextPreprocessor()
 embedder = Embedder()
-similarity_calc = SimilarityCalculator()
+similarity_calc = SimilarityCalculator(min_skill_overlap=0.2)  # 20% minimum skill overlap required
 skill_extractor = SkillExtractor()
 clusterer = Clusterer()
 data_store = DataStore()
+category_classifier = CategoryClassifier()
 
 # Use temporary directory for PDF processing (files deleted after extraction)
 TEMP_DIR = Path(tempfile.gettempdir()) / "resume_uploads"
@@ -140,15 +142,32 @@ async def process_resume(request: ProcessResumeRequest, session_id: str = Depend
         processed_resume = preprocessor.preprocess(resume_text)
         processed_job = preprocessor.preprocess(job_desc)
         
+        # Extract skills first (needed for skill gate)
+        resume_skills = skill_extractor.extract_skills(resume_text)
+        jd_skills = skill_extractor.extract_skills(job_desc)
+        
         # Generate embeddings
         resume_embedding = embedder.embed(processed_resume)
         job_embedding = embedder.embed(processed_job)
         
-        # Calculate similarity
-        similarity_score = similarity_calc.cosine_similarity(resume_embedding, job_embedding)
+        # Calculate semantic similarity
+        semantic_sim = similarity_calc.cosine_similarity(resume_embedding, job_embedding)
         
-        # Extract skills
-        skills = skill_extractor.extract_skills(resume_text)
+        # Classify categories
+        resume_category = category_classifier.classify(resume_text)
+        job_category = category_classifier.classify(job_desc)
+        
+        # Calculate final score with skill gating and weighted scoring
+        score_result = similarity_calc.calculate_final_score(
+            semantic_similarity=semantic_sim,
+            resume_skills=resume_skills,
+            jd_skills=jd_skills,
+            resume_category=resume_category,
+            job_category=job_category
+        )
+        
+        similarity_score = score_result["final_score"]
+        skills = resume_skills
         
         # Add embedding to clusterer for clustering
         clusterer.add_embedding(resume_embedding)
@@ -169,6 +188,10 @@ async def process_resume(request: ProcessResumeRequest, session_id: str = Depend
         return {
             "resume_id": resume_id,
             "similarity_score": float(similarity_score),
+            "semantic_similarity": score_result.get("semantic_similarity", 0.0),
+            "skill_coverage": score_result.get("skill_coverage", 0.0),
+            "skill_gate_passed": score_result.get("skill_gate_passed", False),
+            "flag": score_result.get("flag"),
             "skills": skills,
             "cluster_label": int(cluster_label)
         }
@@ -229,11 +252,34 @@ async def top_candidates(job_description: str = "", session_id: str = Depends(ge
                     if isinstance(resume_emb, list):
                         resume_emb = np.array(resume_emb)
                 
-                # Calculate similarity
-                similarity = similarity_calc.cosine_similarity(
-                    resume_emb, job_embedding
+                # Extract skills for skill gate
+                candidate_skills = candidate.get("skills", [])
+                if not candidate_skills:
+                    candidate_skills = skill_extractor.extract_skills(candidate.get("text", ""))
+                jd_skills = skill_extractor.extract_skills(job_description)
+                
+                # Calculate semantic similarity
+                semantic_sim = similarity_calc.cosine_similarity(resume_emb, job_embedding)
+                
+                # Classify categories
+                resume_category = category_classifier.classify(candidate.get("text", ""))
+                job_category = category_classifier.classify(job_description)
+                
+                # Calculate final score with skill gating
+                score_result = similarity_calc.calculate_final_score(
+                    semantic_similarity=semantic_sim,
+                    resume_skills=candidate_skills,
+                    jd_skills=jd_skills,
+                    resume_category=resume_category,
+                    job_category=job_category
                 )
-                candidate["similarity_score"] = float(similarity)
+                
+                candidate["similarity_score"] = float(score_result["final_score"])
+                candidate["semantic_similarity"] = score_result.get("semantic_similarity", 0.0)
+                candidate["skill_coverage"] = score_result.get("skill_coverage", 0.0)
+                candidate["skill_gate_passed"] = score_result.get("skill_gate_passed", False)
+                if score_result.get("flag"):
+                    candidate["flag"] = score_result.get("flag")
                 # Update similarity score in data store
                 if candidate.get("resume_id"):
                     existing_resume = data_store.get_resume(session_id, candidate["resume_id"])
@@ -241,7 +287,7 @@ async def top_candidates(job_description: str = "", session_id: str = Depends(ge
                         data_store.update_resume_processing(
                             session_id,
                             candidate["resume_id"],
-                            float(similarity),
+                            float(score_result["final_score"]),
                             existing_resume.get("skills", []),
                             existing_resume.get("cluster_label", 0),
                             existing_resume.get("embedding", resume_emb.tolist() if isinstance(resume_emb, np.ndarray) else resume_emb)
